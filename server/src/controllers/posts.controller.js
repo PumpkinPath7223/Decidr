@@ -7,7 +7,6 @@ const createPostSchema = z.object({
   option_a: z.string().min(1).max(200),
   option_b: z.string().min(1).max(200),
   category_tags: z.array(z.string().min(1).max(50)).max(5).optional().default([]),
-  reveal_at: z.string().datetime({ message: 'reveal_at must be an ISO 8601 datetime' }),
   is_live_crisis: z.boolean().optional().default(false),
 });
 
@@ -26,24 +25,8 @@ export async function createPost(req, res, next) {
     return res.status(400).json({ success: false, error: parsed.error.issues[0].message });
   }
 
-  const { reveal_at, is_live_crisis, ...rest } = parsed.data;
-  const revealDate = new Date(reveal_at);
-
-  if (revealDate <= new Date()) {
-    return res.status(400).json({ success: false, error: 'reveal_at must be in the future' });
-  }
-
-  // Live Crisis Mode: override reveal_at to exactly 2 hours from now
-  const finalRevealAt = is_live_crisis
-    ? new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString()
-    : reveal_at;
-
   try {
-    const post = await postsService.createPost(req.user.id, {
-      ...rest,
-      reveal_at: finalRevealAt,
-      is_live_crisis,
-    });
+    const post = await postsService.createPost(req.user.id, parsed.data);
     return res.status(201).json({ success: true, data: post });
   } catch (err) {
     next(err);
@@ -68,8 +51,18 @@ export async function getFeed(req, res, next) {
     return res.status(400).json({ success: false, error: parsed.error.issues[0].message });
   }
 
+  // Optionally resolve viewer id from Bearer token to power is_owner flag
+  let viewerId = null;
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    const { data } = await import('../utils/supabase.js').then((m) =>
+      m.default.auth.getUser(authHeader.slice(7))
+    );
+    viewerId = data?.user?.id ?? null;
+  }
+
   try {
-    const result = await postsService.getFeed(parsed.data);
+    const result = await postsService.getFeed({ ...parsed.data, viewerId });
     return res.json({ success: true, data: result });
   } catch (err) {
     next(err);

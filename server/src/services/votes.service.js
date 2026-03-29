@@ -85,6 +85,16 @@ export async function castVote(userId, postId, choice) {
   };
 }
 
+export async function getUserVotes(userId) {
+  const { data, error } = await supabase
+    .from('votes')
+    .select('post_id, choice')
+    .eq('user_id', userId);
+
+  if (error) throw error;
+  return data;
+}
+
 export async function getVoteCounts(postId) {
   const { data, error } = await supabase
     .from('votes')
