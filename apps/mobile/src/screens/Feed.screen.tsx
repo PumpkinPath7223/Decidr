@@ -1,51 +1,67 @@
-import React, { useCallback, useMemo } from 'react';
-import {
-  ActivityIndicator,
-  FlatList,
-  RefreshControl,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import { type NativeStackNavigationProp } from '@react-navigation/native-stack';
+import React, { useCallback, useMemo, useState } from 'react';
+import { ActivityIndicator, FlatList, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import DecisionCard from '../components/DecisionCard';
-import { useFeed } from '../hooks/useFeed';
-import { type Post } from '../services/api.service';
+import { EmptyState, ErrorState, LoadingState } from '../components/ScreenState';
+import TagFilter from '../components/TagFilter';
+import { flattenPages } from '../hooks/postCache';
+import { useFeed } from '../hooks/usePosts';
+import { type RootStackParamList } from '../navigation/types';
+import { errorMessage } from '../services/api.service';
+import { colors } from '../theme';
+import { type Category, type Post } from '../types';
 
 export default function FeedScreen() {
-  const { data, isLoading, isError, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    useFeed();
+  const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
+  const [tag, setTag] = useState<Category | null>(null);
+  const { data, error, isLoading, isError, isRefetching, refetch, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useFeed(tag);
+  const [pulling, setPulling] = useState(false);
 
-  const posts = useMemo<Post[]>(() => {
-    const flat = data?.pages.flatMap((p) => p.posts) ?? [];
-    console.log(`[FeedScreen] rendering ${flat.length} posts, isLoading=${isLoading}, isError=${isError}`);
-    return flat;
-  }, [data, isLoading, isError]);
+  const posts = useMemo(() => flattenPages(data), [data]);
 
-  const renderItem = useCallback(
-    ({ item, index }: { item: Post; index: number }) => (
-      <DecisionCard post={item} index={index} />
-    ),
-    []
-  );
+  const openPost = useCallback((postId: string) => navigation.navigate('PostDetail', { postId }), [navigation]);
+  const renderItem = useCallback(({ item }: { item: Post }) => <DecisionCard post={item} onOpen={openPost} />, [openPost]);
 
   const onEndReached = useCallback(() => {
-    if (hasNextPage && !isFetchingNextPage) fetchNextPage();
+    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
   }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
 
-  if (isLoading) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color="#6366F1" />
-      </View>
-    );
-  }
+  const onRefresh = useCallback(async () => {
+    setPulling(true);
+    try {
+      await refetch();
+    } finally {
+      setPulling(false);
+    }
+  }, [refetch]);
 
-  if (isError) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.errorText}>Couldn't load the feed. Pull to retry.</Text>
-      </View>
+  let body: React.ReactNode;
+  if (isLoading) {
+    body = <LoadingState />;
+  } else if (isError && posts.length === 0) {
+    body = <ErrorState message={errorMessage(error)} onRetry={() => void refetch()} />;
+  } else {
+    body = (
+      <FlatList
+        data={posts}
+        keyExtractor={(item) => item.id}
+        renderItem={renderItem}
+        contentContainerStyle={styles.list}
+        showsVerticalScrollIndicator={false}
+        onEndReached={onEndReached}
+        onEndReachedThreshold={0.4}
+        refreshControl={<RefreshControl refreshing={pulling && isRefetching} onRefresh={onRefresh} tintColor={colors.primary} />}
+        ListFooterComponent={isFetchingNextPage ? <ActivityIndicator style={styles.footer} color={colors.primary} /> : null}
+        ListEmptyComponent={
+          <EmptyState
+            title={tag ? `No #${tag} decisions yet` : 'No decisions yet'}
+            hint="Be the first — tap Ask to post one."
+          />
+        }
+      />
     );
   }
 
@@ -55,38 +71,17 @@ export default function FeedScreen() {
         <Text style={styles.wordmark}>decidr</Text>
         <Text style={styles.tagline}>What's the verdict?</Text>
       </View>
-      <FlatList
-        data={posts}
-        keyExtractor={(item) => item.id}
-        renderItem={renderItem}
-        contentContainerStyle={styles.list}
-        showsVerticalScrollIndicator={false}
-        onEndReached={onEndReached}
-        onEndReachedThreshold={0.4}
-        refreshControl={
-          <RefreshControl refreshing={isLoading} onRefresh={refetch} tintColor="#6366F1" />
-        }
-        ListFooterComponent={
-          isFetchingNextPage ? <ActivityIndicator style={styles.footer} color="#6366F1" /> : null
-        }
-        ListEmptyComponent={
-          <View style={styles.center}>
-            <Text style={styles.emptyText}>No decisions yet. Be the first to post.</Text>
-          </View>
-        }
-      />
+      <TagFilter value={tag} onChange={setTag} />
+      {body}
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F9FAFB' },
-  headerBar: { paddingHorizontal: 20, paddingBottom: 8, paddingTop: 4 },
-  wordmark: { fontSize: 26, fontWeight: '800', color: '#111827', letterSpacing: -0.5 },
-  tagline: { fontSize: 12, color: '#9CA3AF', marginTop: 1 },
-  list: { paddingBottom: 32, paddingTop: 8 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
-  errorText: { fontSize: 15, color: '#EF4444', textAlign: 'center' },
-  emptyText: { fontSize: 15, color: '#9CA3AF', textAlign: 'center' },
+  container: { flex: 1, backgroundColor: colors.bg },
+  headerBar: { paddingHorizontal: 20, paddingBottom: 4, paddingTop: 4 },
+  wordmark: { fontSize: 26, fontWeight: '800', color: colors.text, letterSpacing: -0.5 },
+  tagline: { fontSize: 12, color: colors.textMuted, marginTop: 1 },
+  list: { paddingBottom: 32, paddingTop: 4, flexGrow: 1 },
   footer: { paddingVertical: 20 },
 });

@@ -1,24 +1,24 @@
 import { z } from 'zod';
 import { revealPost } from '../services/reveal.service.js';
+import { LIMITS } from '../utils/constants.js';
+import { parse, parseId } from '../utils/validate.js';
 
 const revealSchema = z.object({
-  outcome_text: z.string().min(1).max(1000),
-  poster_feeling: z.enum(['happy', 'regret']),
+  chosen_option: z.enum(['A', 'B'], { message: 'Tell us which option you went with' }),
+  poster_feeling: z.enum(['happy', 'regret'], { message: 'Tell us how you feel about it' }),
+  outcome_text: z
+    .string()
+    .trim()
+    .max(LIMITS.outcome.max)
+    .optional()
+    .transform((value) => value || undefined),
 });
 
 export async function submitReveal(req, res, next) {
-  const parsed = revealSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ success: false, error: parsed.error.issues[0].message });
-  }
-
   try {
-    const result = await revealPost(req.user.id, req.params.id, parsed.data);
-    return res.json({ success: true, data: result });
+    const data = await revealPost(req.user.id, parseId(req.params.id), parse(revealSchema, req.body));
+    res.json({ success: true, data });
   } catch (err) {
-    if (err.status) {
-      return res.status(err.status).json({ success: false, error: err.message });
-    }
     next(err);
   }
 }

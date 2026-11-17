@@ -1,53 +1,94 @@
-import { NavigationContainer } from '@react-navigation/native';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import React, { useEffect } from 'react';
-import { ActivityIndicator, View } from 'react-native';
-import LoginScreen from '../screens/Login.screen';
+import React, { useEffect, useRef } from 'react';
+import { Text } from 'react-native';
+import { LoadingState } from '../components/ScreenState';
+import CreatePostScreen from '../screens/CreatePost.screen';
 import FeedScreen from '../screens/Feed.screen';
-import { usersApi } from '../services/api.service';
+import LoginScreen from '../screens/Login.screen';
+import PostDetailScreen from '../screens/PostDetail.screen';
+import ProfileScreen from '../screens/Profile.screen';
+import RanksScreen from '../screens/Ranks.screen';
+import { onNotificationOpened, registerForPush } from '../services/notifications.service';
 import { useAuthStore } from '../store/auth.store';
-import { useVotesStore } from '../store/votes.store';
-
-export type RootStackParamList = {
-  Login: undefined;
-  Feed: undefined;
-};
+import { colors } from '../theme';
+import { type RootStackParamList, type TabParamList } from './types';
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
+const Tab = createBottomTabNavigator<TabParamList>();
+const navigationRef = createNavigationContainerRef<RootStackParamList>();
+
+const TAB_ICONS: Record<keyof TabParamList, string> = {
+  Feed: '🗳️',
+  Create: '➕',
+  Ranks: '🏆',
+  Profile: '👤',
+};
+
+function Tabs() {
+  return (
+    <Tab.Navigator
+      screenOptions={({ route }) => ({
+        headerShown: false,
+        tabBarActiveTintColor: colors.primary,
+        tabBarInactiveTintColor: colors.textMuted,
+        tabBarLabelStyle: { fontSize: 11, fontWeight: '600' },
+        tabBarIcon: ({ focused }) => (
+          <Text style={{ fontSize: 18, opacity: focused ? 1 : 0.55 }}>{TAB_ICONS[route.name]}</Text>
+        ),
+      })}
+    >
+      <Tab.Screen name="Feed" component={FeedScreen} />
+      <Tab.Screen name="Create" component={CreatePostScreen} options={{ title: 'Ask' }} />
+      <Tab.Screen name="Ranks" component={RanksScreen} />
+      <Tab.Screen name="Profile" component={ProfileScreen} />
+    </Tab.Navigator>
+  );
+}
 
 export default function RootNavigator() {
-  const { hydrated, hydrate, token, user } = useAuthStore();
-  const votesHydrate = useVotesStore((s) => s.hydrate);
-  const preloadVotes = useVotesStore((s) => s.preloadVotes);
+  const hydrated = useAuthStore((s) => s.hydrated);
+  const hydrate = useAuthStore((s) => s.hydrate);
+  const signedIn = useAuthStore((s) => s.token !== null);
+  const pendingPostId = useRef<string | null>(null);
 
-  // Hydrate both stores in parallel on startup.
   useEffect(() => {
-    hydrate();
-    votesHydrate();
-  }, []);
+    void hydrate();
+  }, [hydrate]);
 
-  // Once auth is known and the user is logged in, fetch their server-side votes
-  // and merge them into the store so already-voted posts start locked.
+  // Once signed in: register this device for reveal notifications and open the post
+  // when one is tapped.
   useEffect(() => {
-    if (!hydrated || !token || !user) return;
-    usersApi.getMyVotes(user.id, token)
-      .then(preloadVotes)
-      .catch(() => {}); // non-critical — AsyncStorage store is the primary source
-  }, [hydrated, token, user?.id]);
+    if (!hydrated || !signedIn) return;
+    void registerForPush();
+    return onNotificationOpened((postId) => {
+      if (navigationRef.isReady()) navigationRef.navigate('PostDetail', { postId });
+      // Launched from the notification: the navigator is not mounted yet.
+      else pendingPostId.current = postId;
+    });
+  }, [hydrated, signedIn]);
 
-  if (!hydrated) {
-    return (
-      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F9FAFB' }}>
-        <ActivityIndicator size="large" color="#6366F1" />
-      </View>
-    );
+  function openPendingPost() {
+    const postId = pendingPostId.current;
+    pendingPostId.current = null;
+    if (postId && useAuthStore.getState().token !== null) {
+      navigationRef.navigate('PostDetail', { postId });
+    }
   }
 
+  if (!hydrated) return <LoadingState />;
+
+  // Which screens exist depends on the session, so signing in or out switches stacks
+  // automatically — screens never navigate to "Login" or "Tabs" by hand.
   return (
-    <NavigationContainer>
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
-        {token ? (
-          <Stack.Screen name="Feed" component={FeedScreen} />
+    <NavigationContainer ref={navigationRef} onReady={openPendingPost}>
+      <Stack.Navigator screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.bg } }}>
+        {signedIn ? (
+          <>
+            <Stack.Screen name="Tabs" component={Tabs} />
+            <Stack.Screen name="PostDetail" component={PostDetailScreen} />
+          </>
         ) : (
           <Stack.Screen name="Login" component={LoginScreen} />
         )}

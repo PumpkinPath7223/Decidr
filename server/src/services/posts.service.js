@@ -1,104 +1,101 @@
 import supabase from '../utils/supabase.js';
+import { AppError, throwDbError } from '../utils/AppError.js';
+import { FEED_PAGE_SIZE, LIVE_CRISIS_SECONDS, REVEAL_TIMERS } from '../utils/constants.js';
+import { decodeCursor, encodeCursor } from '../utils/cursor.js';
+import { CRISIS_MESSAGE, containsAbuse, containsCrisisLanguage } from '../utils/moderation.js';
+import { serializePost } from '../serializers/posts.serializer.js';
 
-// author_id excluded from public responses but fetched internally for is_owner
-const PUBLIC_POST_COLUMNS = `
-  id,
-  author_id,
-  title,
-  context,
-  option_a,
-  option_b,
-  category_tags,
-  revealed,
-  outcome_text,
-  poster_feeling,
-  is_live_crisis,
-  created_at
-`.trim();
-
-function attachVoteCounts(post, countsMap) {
-  const c = countsMap[post.id] ?? { votes_a: 0, votes_b: 0, total_votes: 0 };
-  return { ...post, votes_a: c.votes_a, votes_b: c.votes_b, total_votes: c.total_votes };
+async function queryPosts({ viewerId = null, tag = null, postId = null, scope = 'feed', cursor = null, limit = FEED_PAGE_SIZE }) {
+  const { data, error } = await supabase.rpc('query_posts', {
+    p_viewer_id: viewerId,
+    p_tag: tag,
+    p_post_id: postId,
+    p_scope: scope,
+    p_cursor_created_at: cursor?.createdAt ?? null,
+    p_cursor_id: cursor?.id ?? null,
+    p_limit: limit,
+  });
+  throwDbError(error);
+  return data ?? [];
 }
 
-function sanitizeForPublic(post, viewerId) {
-  const { author_id, ...rest } = post;
-  return { ...rest, is_owner: viewerId ? author_id === viewerId : false };
+// One page of posts plus the cursor for the next one. Asks for one extra row to know
+// whether another page exists.
+async function listPosts({ viewerId, tag, scope, cursor }) {
+  const rows = await queryPosts({
+    viewerId,
+    tag,
+    scope,
+    cursor: decodeCursor(cursor),
+    limit: FEED_PAGE_SIZE + 1,
+  });
+  const page = rows.slice(0, FEED_PAGE_SIZE);
+  const hasMore = rows.length > FEED_PAGE_SIZE;
+
+  return {
+    posts: page.map((row) => serializePost(row, viewerId)),
+    next_cursor: hasMore ? encodeCursor(page[page.length - 1]) : null,
+  };
 }
 
-async function fetchVoteCountsForPosts(postIds) {
-  if (!postIds.length) return {};
-
-  const { data, error } = await supabase
-    .from('votes')
-    .select('post_id, choice')
-    .in('post_id', postIds);
-
-  if (error) throw error;
-
-  const map = {};
-  for (const v of data) {
-    if (!map[v.post_id]) map[v.post_id] = { votes_a: 0, votes_b: 0, total_votes: 0 };
-    map[v.post_id].total_votes += 1;
-    if (v.choice === 'A') map[v.post_id].votes_a += 1;
-    else map[v.post_id].votes_b += 1;
-  }
-  return map;
+export function getFeed({ viewerId = null, tag = null, cursor = null }) {
+  return listPosts({ viewerId, tag, scope: 'feed', cursor });
 }
 
-export async function createPost(authorId, fields) {
-  const { data, error } = await supabase
-    .from('posts')
-    .insert({ author_id: authorId, ...fields })
-    .select(PUBLIC_POST_COLUMNS)
-    .single();
+export function getMyPosts({ userId, cursor = null }) {
+  return listPosts({ viewerId: userId, tag: null, scope: 'mine', cursor });
+}
 
-  if (error) throw error;
-  return data;
+export function getMyVotedPosts({ userId, cursor = null }) {
+  return listPosts({ viewerId: userId, tag: null, scope: 'voted', cursor });
 }
 
 export async function getPostById(postId, viewerId = null) {
+  const [row] = await queryPosts({ viewerId, postId, limit: 1 });
+  if (!row) throw new AppError(404, 'Post not found');
+  return serializePost(row, viewerId);
+}
+
+export async function createPost(authorId, input) {
+  const texts = [input.title, input.context, input.option_a, input.option_b];
+  if (containsCrisisLanguage(...texts)) {
+    throw new AppError(422, CRISIS_MESSAGE, 'CRISIS_RESOURCES');
+  }
+  if (containsAbuse(...texts)) {
+    throw new AppError(422, 'This post contains language that is not allowed on Decidr', 'CONTENT_REJECTED');
+  }
+
+  const seconds = input.is_live_crisis ? LIVE_CRISIS_SECONDS : REVEAL_TIMERS[input.reveal_in];
+  const revealAt = new Date(Date.now() + seconds * 1000).toISOString();
+
   const { data, error } = await supabase
     .from('posts')
-    .select(PUBLIC_POST_COLUMNS)
-    .eq('id', postId)
+    .insert({
+      author_id: authorId,
+      title: input.title,
+      context: input.context ?? null,
+      option_a: input.option_a,
+      option_b: input.option_b,
+      category_tags: input.category_tags,
+      reveal_at: revealAt,
+      is_live_crisis: input.is_live_crisis,
+      comments_enabled: input.comments_enabled,
+    })
+    .select('id')
     .single();
 
   if (error) {
-    if (error.code === 'PGRST116') return null;
+    if (error.code === '23505') {
+      throw new AppError(409, 'You already have a Live Crisis post running. Wait for it to close first.');
+    }
+    if (error.code === '23503') throw new AppError(404, 'User not found');
     throw error;
   }
 
-  const countsMap = await fetchVoteCountsForPosts([data.id]);
-  return sanitizeForPublic(attachVoteCounts(data, countsMap), viewerId);
+  return getPostById(data.id, authorId);
 }
 
-export async function getFeed({ page = 1, hashtag, viewerId = null } = {}) {
-  const limit = 20;
-  const offset = (page - 1) * limit;
-
-  let query = supabase
-    .from('posts')
-    .select(PUBLIC_POST_COLUMNS, { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-
-  if (hashtag) {
-    query = query.contains('category_tags', [hashtag]);
-  }
-
-  const { data, error, count } = await query;
-  if (error) throw error;
-
-  const countsMap = await fetchVoteCountsForPosts(data.map((p) => p.id));
-
-  return {
-    posts: data.map((p) => sanitizeForPublic(attachVoteCounts(p, countsMap), viewerId)),
-    pagination: {
-      page,
-      limit,
-      total: count,
-      has_more: offset + limit < count,
-    },
-  };
+export async function deletePost(authorId, postId) {
+  const { error } = await supabase.rpc('delete_post', { p_author_id: authorId, p_post_id: postId });
+  throwDbError(error);
 }

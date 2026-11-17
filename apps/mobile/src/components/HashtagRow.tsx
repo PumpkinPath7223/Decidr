@@ -1,26 +1,28 @@
 import React from 'react';
-import { ScrollView, StyleSheet, Text } from 'react-native';
+import { StyleSheet, Text, View } from 'react-native';
+import { colors } from '../theme';
 
 type Props = { tags: string[] };
 
 export default function HashtagRow({ tags }: Props) {
   if (!tags.length) return null;
   return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.scroll} contentContainerStyle={styles.container}>
+    <View style={styles.container}>
       {tags.map((tag) => (
-        <Text key={tag} style={styles.tag}>#{tag}</Text>
+        <Text key={tag} style={styles.tag}>
+          #{tag}
+        </Text>
       ))}
-    </ScrollView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  scroll: { marginTop: 10 },
-  container: { gap: 6, paddingRight: 4 },
+  container: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
   tag: {
     fontSize: 12,
-    color: '#6366F1',
-    backgroundColor: '#EEF2FF',
+    color: colors.primary,
+    backgroundColor: colors.primaryLight,
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 8,

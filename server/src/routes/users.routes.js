@@ -1,20 +1,24 @@
 import { Router } from 'express';
+import {
+  clearPushToken,
+  deleteAccount,
+  getMe,
+  getMyPosts,
+  getMyVotes,
+  getPublicProfile,
+  setPushToken,
+} from '../controllers/users.controller.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
-import * as votesService from '../services/votes.service.js';
 
 const router = Router();
 
-// GET /api/users/:id/votes — returns the authenticated user's votes (only own votes allowed)
-router.get('/:id/votes', requireAuth, async (req, res, next) => {
-  if (req.params.id !== req.user.id) {
-    return res.status(403).json({ success: false, error: 'Forbidden' });
-  }
-  try {
-    const votes = await votesService.getUserVotes(req.user.id);
-    return res.json({ success: true, data: votes });
-  } catch (err) {
-    next(err);
-  }
-});
+// '/me' routes are registered before '/:id' so "me" is never read as an id.
+router.get('/me', requireAuth, getMe);
+router.delete('/me', requireAuth, deleteAccount);
+router.get('/me/posts', requireAuth, getMyPosts);
+router.get('/me/votes', requireAuth, getMyVotes);
+router.put('/me/push-token', requireAuth, setPushToken);
+router.delete('/me/push-token', requireAuth, clearPushToken);
+router.get('/:id/profile', getPublicProfile);
 
 export default router;

@@ -1,117 +1,171 @@
-const BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000';
+import { useAuthStore } from '../store/auth.store';
+import {
+  type Category,
+  type Choice,
+  type Comment,
+  type ContentTarget,
+  type CreatePostInput,
+  type LeaderboardEntry,
+  type Post,
+  type PostPage,
+  type Profile,
+  type RegretEntry,
+  type RevealInput,
+  type RevealResponse,
+  type Session,
+  type VoteResponse,
+} from '../types';
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const { headers: extraHeaders, ...restOptions } = options ?? {};
-  if (__DEV__ && restOptions.body) {
-    console.log('[api] request', restOptions.method, path, 'body:', restOptions.body);
+const BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000').replace(/\/+$/, '');
+
+export class ApiError extends Error {
+  status: number;
+  code: string | null;
+
+  constructor(message: string, status: number, code: string | null = null) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
   }
-  const res = await fetch(`${BASE_URL}${path}`, {
-    ...restOptions,
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-  const json = await res.json();
-  if (!json.success) throw new Error(json.error ?? 'Request failed');
-  return json.data as T;
 }
 
-export type Post = {
-  id: string;
-  title: string;
-  context: string | null;
-  option_a: string;
-  option_b: string;
-  category_tags: string[];
-  revealed: boolean;
-  outcome_text: string | null;
-  poster_feeling: 'happy' | 'regret' | null;
-  is_live_crisis: boolean;
-  is_owner: boolean;
-  created_at: string;
-  votes_a: number | null;
-  votes_b: number | null;
-  total_votes: number | null;
+type Envelope<T> = { success: true; data: T } | { success: false; error?: string; code?: string };
+
+type RequestOptions = {
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  body?: unknown;
 };
 
-export type FeedResponse = {
-  posts: Post[];
-  pagination: { page: number; limit: number; total: number; has_more: boolean };
-};
-
-export type VoteResult = {
-  vote: { id: string; choice: string; weight: number; created_at: string };
-  voter_stats: { points: number; total_votes: number; rank: string };
-};
-
-export const feedApi = {
-  getFeed: async (page = 1, hashtag?: string, token?: string | null) => {
-    const params = new URLSearchParams({ page: String(page) });
-    if (hashtag) params.set('hashtag', hashtag);
-    const result = await request<FeedResponse>(`/api/feed?${params}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+async function send<T>(path: string, options: RequestOptions, token: string | null): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}${path}`, {
+      method: options.method ?? 'GET',
+      headers: {
+        ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     });
-    if (__DEV__) {
-      console.log('[feed] first post raw:', JSON.stringify(result.posts[0], null, 2));
+  } catch {
+    throw new ApiError("Can't reach the server. Check your connection and try again.", 0, 'NETWORK');
+  }
+
+  let json: Envelope<T>;
+  try {
+    json = (await response.json()) as Envelope<T>;
+  } catch {
+    throw new ApiError('Something went wrong. Please try again.', response.status);
+  }
+
+  if (!json.success) {
+    throw new ApiError(json.error ?? 'Request failed', response.status, json.code ?? null);
+  }
+  return json.data;
+}
+
+// Access tokens last about an hour. All requests that hit a 401 at the same time share one
+// refresh call.
+let refreshInFlight: Promise<'refreshed' | 'expired' | 'offline'> | null = null;
+
+async function refreshSession(): Promise<'refreshed' | 'expired' | 'offline'> {
+  const { refreshToken, setTokens } = useAuthStore.getState();
+  if (!refreshToken) return 'expired';
+  try {
+    const data = await send<{ token: string; refresh_token: string }>(
+      '/api/auth/refresh',
+      { method: 'POST', body: { refresh_token: refreshToken } },
+      null
+    );
+    await setTokens(data.token, data.refresh_token);
+    return 'refreshed';
+  } catch (err) {
+    // Only a definite "no" from the server ends the session; being offline does not.
+    return err instanceof ApiError && err.status === 401 ? 'expired' : 'offline';
+  }
+}
+
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const token = useAuthStore.getState().token;
+  try {
+    return await send<T>(path, options, token);
+  } catch (err) {
+    const isAuthFailure = err instanceof ApiError && err.status === 401 && token !== null;
+    if (!isAuthFailure) throw err;
+
+    refreshInFlight ??= (async () => {
+      try {
+        return await refreshSession();
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+    const outcome = await refreshInFlight;
+
+    if (outcome === 'refreshed') {
+      return send<T>(path, options, useAuthStore.getState().token);
     }
-    return result;
-  },
+    if (outcome === 'expired') {
+      await useAuthStore.getState().clearAuth();
+      throw new ApiError('Your session expired. Please sign in again.', 401, 'SESSION_EXPIRED');
+    }
+    throw err;
+  }
+}
 
-  getPost: (id: string) => request<Post>(`/api/posts/${id}`),
-};
-
-export const voteApi = {
-  castVote: (postId: string, choice: 'A' | 'B', token: string) =>
-    request<VoteResult>(`/api/posts/${postId}/vote`, {
-      method: 'POST',
-      body: JSON.stringify({ choice }),
-      headers: { Authorization: `Bearer ${token}` },
-    }),
-};
-
-export type RevealResult = {
-  revealed: boolean;
-  winning_choice: 'A' | 'B';
-  correct_voters: number;
-};
-
-export const revealApi = {
-  submit: (postId: string, outcome_text: string, poster_feeling: 'happy' | 'regret', token: string) =>
-    request<RevealResult>(`/api/posts/${postId}/reveal`, {
-      method: 'POST',
-      body: JSON.stringify({ outcome_text, poster_feeling }),
-      headers: { Authorization: `Bearer ${token}` },
-    }),
-};
-
-export type AuthUser = {
-  id: string;
-  email: string;
-  username: string;
-  rank?: string;
-  points?: number;
-  accuracy_score?: number;
-};
-
-export type AuthResponse = { token: string; user: AuthUser };
+function query(params: Record<string, string | null | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value) search.set(key, value);
+  }
+  const text = search.toString();
+  return text ? `?${text}` : '';
+}
 
 export const authApi = {
   login: (email: string, password: string) =>
-    request<AuthResponse>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
-
+    send<Session>('/api/auth/login', { method: 'POST', body: { email, password } }, null),
   register: (email: string, password: string, username: string) =>
-    request<AuthResponse>('/api/auth/register', {
-      method: 'POST',
-      body: JSON.stringify({ email, password, username }),
-    }),
+    send<Session>('/api/auth/register', { method: 'POST', body: { email, password, username } }, null),
 };
 
-export type UserVote = { post_id: string; choice: 'A' | 'B' };
+export const postsApi = {
+  feed: (tag: Category | null, cursor: string | null) => request<PostPage>(`/api/feed${query({ tag, cursor })}`),
+  get: (id: string) => request<Post>(`/api/posts/${id}`),
+  create: (input: CreatePostInput) => request<Post>('/api/posts', { method: 'POST', body: input }),
+  remove: (id: string) => request<{ deleted: boolean }>(`/api/posts/${id}`, { method: 'DELETE' }),
+  vote: (id: string, choice: Choice) =>
+    request<VoteResponse>(`/api/posts/${id}/vote`, { method: 'POST', body: { choice } }),
+  reveal: (id: string, input: RevealInput) =>
+    request<RevealResponse>(`/api/posts/${id}/reveal`, { method: 'POST', body: input }),
+  comments: (id: string) => request<Comment[]>(`/api/posts/${id}/comments`),
+  addComment: (id: string, body: string) =>
+    request<Comment>(`/api/posts/${id}/comments`, { method: 'POST', body: { body } }),
+};
 
 export const usersApi = {
-  getMyVotes: (userId: string, token: string) =>
-    request<UserVote[]>(`/api/users/${userId}/votes`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }),
+  me: () => request<Profile>('/api/users/me'),
+  myPosts: (cursor: string | null) => request<PostPage>(`/api/users/me/posts${query({ cursor })}`),
+  myVotes: (cursor: string | null) => request<PostPage>(`/api/users/me/votes${query({ cursor })}`),
+  setPushToken: (pushToken: string) =>
+    request<{ registered: boolean }>('/api/users/me/push-token', { method: 'PUT', body: { push_token: pushToken } }),
+  clearPushToken: () => request<{ registered: boolean }>('/api/users/me/push-token', { method: 'DELETE' }),
+  deleteAccount: () => request<{ deleted: boolean }>('/api/users/me', { method: 'DELETE' }),
 };
+
+export const statsApi = {
+  leaderboard: () => request<LeaderboardEntry[]>('/api/leaderboard'),
+  regretIndex: () => request<RegretEntry[]>('/api/regret-index'),
+};
+
+export const safetyApi = {
+  report: (target: ContentTarget, reason: string) =>
+    request<{ reported: boolean }>('/api/reports', { method: 'POST', body: { ...target, reason } }),
+  block: (target: ContentTarget) => request<{ blocked: boolean }>('/api/blocks', { method: 'POST', body: target }),
+  clearBlocks: () => request<{ cleared: boolean }>('/api/blocks', { method: 'DELETE' }),
+};
+
+export function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : 'Something went wrong';
+}

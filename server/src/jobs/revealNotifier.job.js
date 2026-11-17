@@ -1,78 +1,57 @@
 import cron from 'node-cron';
-import Expo from 'expo-server-sdk';
 import supabase from '../utils/supabase.js';
+import { sendPush } from '../utils/push.js';
 
-const expo = new Expo();
-
-async function sendRevealNotifications() {
-  // Find posts whose reveal window has passed but haven't been revealed yet
-  const { data: posts, error: postsError } = await supabase
+// Every 5 minutes: close voting on posts whose timer has run out and ask the author
+// what they chose.
+//
+// The UPDATE is the claim. A post leaves 'open' in the same statement that returns it,
+// so running the job twice (or on two servers) can never notify the same post twice.
+export async function closeExpiredPosts(now = new Date()) {
+  const { data: posts, error } = await supabase
     .from('posts')
-    .select('id, title')
-    .lt('reveal_at', new Date().toISOString())
-    .eq('revealed', false);
+    .update({ status: 'awaiting_outcome', reveal_notified_at: now.toISOString() })
+    .eq('status', 'open')
+    .lte('reveal_at', now.toISOString())
+    .select('id, title, author_id');
 
-  if (postsError) {
-    console.error('[revealNotifier] failed to query posts:', postsError.message);
-    return;
+  if (error) {
+    console.error('[revealNotifier] failed to close expired posts:', error.message);
+    return { closed: 0 };
+  }
+  if (!posts.length) return { closed: 0 };
+
+  const authorIds = [...new Set(posts.map((post) => post.author_id))];
+  const { data: authors, error: authorsError } = await supabase
+    .from('users')
+    .select('id, push_token')
+    .in('id', authorIds);
+
+  if (authorsError) {
+    console.error('[revealNotifier] failed to load authors:', authorsError.message);
+    return { closed: posts.length };
   }
 
-  if (!posts.length) return;
-
-  console.log(`[revealNotifier] ${posts.length} post(s) ready to notify`);
-
+  const tokenByAuthor = new Map(authors.map((author) => [author.id, author.push_token]));
   for (const post of posts) {
-    // Fetch push tokens for all users who voted on this post
-    const { data: votes, error: votesError } = await supabase
-      .from('votes')
-      .select('users(push_token)')
-      .eq('post_id', post.id);
-
-    if (votesError) {
-      console.error(`[revealNotifier] failed to fetch votes for post ${post.id}:`, votesError.message);
-      continue;
-    }
-
-    const tokens = votes
-      .map((v) => v.users?.push_token)
-      .filter((t) => t && Expo.isExpoPushToken(t));
-
-    if (!tokens.length) continue;
-
-    const messages = tokens.map((to) => ({
-      to,
-      sound: 'default',
-      title: "Time's up — what happened?",
-      body: "A decision you voted on is ready to reveal — tap to see the outcome.",
-      data: { postId: post.id },
-    }));
-
-    // Expo recommends chunking in batches of 100
-    const chunks = expo.chunkPushNotifications(messages);
-
-    for (const chunk of chunks) {
-      try {
-        const tickets = await expo.sendPushNotificationsAsync(chunk);
-        const failed = tickets.filter((t) => t.status === 'error');
-        if (failed.length) {
-          console.warn(`[revealNotifier] ${failed.length} ticket(s) errored for post ${post.id}`);
-        }
-      } catch (err) {
-        console.error(`[revealNotifier] chunk send failed for post ${post.id}:`, err.message);
-      }
-    }
-
-    console.log(`[revealNotifier] notified ${tokens.length} voter(s) for post ${post.id}`);
+    await sendPush([tokenByAuthor.get(post.author_id)], {
+      title: "Time's up — what did you choose?",
+      body: `Voting has closed on "${post.title}". Tell everyone how it went.`,
+      data: { postId: post.id, type: 'awaiting_outcome' },
+    });
   }
+
+  console.log(`[revealNotifier] closed voting on ${posts.length} post(s)`);
+  return { closed: posts.length };
 }
 
 export function startRevealNotifier() {
-  // Run every 5 minutes
-  cron.schedule('*/5 * * * *', () => {
-    sendRevealNotifications().catch((err) =>
-      console.error('[revealNotifier] unhandled error:', err.message)
-    );
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      await closeExpiredPosts();
+    } catch (err) {
+      console.error('[revealNotifier] unhandled error:', err.message);
+    }
   });
-
-  console.log('[revealNotifier] cron started — runs every 5 minutes');
+  console.log('[revealNotifier] scheduled — every 5 minutes');
 }
